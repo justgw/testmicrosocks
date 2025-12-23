@@ -37,7 +37,7 @@ struct client {
 struct server {
 	int fd;
 };
-
+//test
 int resolve(const char *host, unsigned short port, struct addrinfo** addr);
 int resolve_sa(const char *host, unsigned short port, union sockaddr_union *res);
 int bindtoip(int fd, union sockaddr_union *bindaddr);
