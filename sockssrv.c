@@ -33,7 +33,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
-#include <inttypes.h>
 #include "server.h"
 #include "sblist.h"
 
@@ -66,12 +65,18 @@
 #endif
 
 static int quiet;
+static int show_stats = 0;
 static const char* auth_user;
 static const char* auth_pass;
 static sblist* auth_ips;
 static pthread_rwlock_t auth_ips_lock = PTHREAD_RWLOCK_INITIALIZER;
 static const struct server* server;
 static union sockaddr_union bind_addr = {.v4.sin_family = AF_UNSPEC};
+
+/* traffic statistics */
+static volatile unsigned long long total_bytes_up = 0;
+static volatile unsigned long long total_bytes_down = 0;
+static pthread_mutex_t traffic_lock = PTHREAD_MUTEX_INITIALIZER;
 
 enum socksstate {
 	SS_1_CONNECTED,
@@ -103,8 +108,6 @@ struct thread {
 	struct client client;
 	enum socksstate state;
 	volatile int  done;
-	uint64_t upload_bytes;
-	uint64_t download_bytes;
 };
 
 #ifndef CONFIG_LOG
@@ -269,7 +272,7 @@ static void send_error(int fd, enum errorcode ec) {
 	write(fd, buf, 10);
 }
 
-static void copyloop(int fd1, int fd2, struct thread *t) {
+static void copyloop(int fd1, int fd2) {
 	struct pollfd fds[2] = {
 		[0] = {.fd = fd1, .events = POLLIN},
 		[1] = {.fd = fd2, .events = POLLIN},
@@ -295,18 +298,18 @@ static void copyloop(int fd1, int fd2, struct thread *t) {
 		char buf[MIN(16*1024, THREAD_STACK_SIZE/2)];
 		ssize_t sent = 0, n = read(infd, buf, sizeof buf);
 		if(n <= 0) return;
+		
+		/* update traffic statistics */
+		if(pthread_mutex_lock(&traffic_lock) == 0) {
+			if(infd == fd1) total_bytes_up += n;
+			else total_bytes_down += n;
+			pthread_mutex_unlock(&traffic_lock);
+		}
+		
 		while(sent < n) {
 			ssize_t m = write(outfd, buf+sent, n-sent);
 			if(m < 0) return;
 			sent += m;
-		}
-		// Update traffic statistics
-		if(infd == fd1) {
-			// Data from client to remote: upload
-			t->upload_bytes += n;
-		} else {
-			// Data from remote to client: download
-			t->download_bytes += n;
 		}
 	}
 }
@@ -372,19 +375,10 @@ static void* clientthread(void *data) {
 	struct thread *t = data;
 	int remotefd = handshake(t);
 	if(remotefd != -1) {
-		copyloop(t->client.fd, remotefd, t);
+		copyloop(t->client.fd, remotefd);
 		close(remotefd);
 	}
 	close(t->client.fd);
-	// Log traffic statistics when connection closes
-	if(CONFIG_LOG && t->upload_bytes > 0 || t->download_bytes > 0) {
-		char clientname[256];
-		int af = SOCKADDR_UNION_AF(&t->client.addr);
-		void *ipdata = SOCKADDR_UNION_ADDRESS(&t->client.addr);
-		inet_ntop(af, ipdata, clientname, sizeof clientname);
-		dolog("client[%d] %s: uploaded %" PRIu64 " bytes, downloaded %" PRIu64 " bytes\n", 
-			t->client.fd, clientname, t->upload_bytes, t->download_bytes);
-	}
 	t->done = 1;
 	return 0;
 }
@@ -406,10 +400,11 @@ static int usage(void) {
 	dprintf(2,
 		"MicroSocks SOCKS5 Server\n"
 		"------------------------\n"
-		"usage: microsocks -1 -q -i listenip -p port -u user -P pass -b bindaddr -w ips\n"
+		"usage: microsocks -1 -q -s -i listenip -p port -u user -P pass -b bindaddr -w ips\n"
 		"all arguments are optional.\n"
 		"by default listenip is 0.0.0.0 and port 1080.\n\n"
 		"option -q disables logging.\n"
+		"option -s enables traffic statistics display on exit.\n"
 		"option -b specifies which ip outgoing connections are bound to\n"
 		"option -w allows to specify a comma-separated whitelist of ip addresses,\n"
 		" that may use the proxy without user/pass authentication.\n"
@@ -426,9 +421,55 @@ static int usage(void) {
 }
 
 /* prevent username and password from showing up in top. */
+static volatile int should_exit = 0;
+
+static void format_bytes(unsigned long long bytes, char *buf, size_t bufsize) {
+	const char *units[] = {"B", "KB", "MB", "GB", "TB"};
+	int unit = 0;
+	double size = bytes;
+	
+	while(size >= 1024.0 && unit < 4) {
+		size /= 1024.0;
+		unit++;
+	}
+	
+	snprintf(buf, bufsize, "%.2f %s", size, units[unit]);
+}
+
+static void show_traffic_stats(void) {
+	char up_str[32], down_str[32], total_str[32];
+	unsigned long long up = 0, down = 0, total;
+	
+	if(pthread_mutex_lock(&traffic_lock) == 0) {
+		up = total_bytes_up;
+		down = total_bytes_down;
+		pthread_mutex_unlock(&traffic_lock);
+	}
+	
+	total = up + down;
+	format_bytes(up, up_str, sizeof(up_str));
+	format_bytes(down, down_str, sizeof(down_str));
+	format_bytes(total, total_str, sizeof(total_str));
+	
+	dprintf(2, "\n=== Traffic Statistics ===\n");
+	dprintf(2, "Upload:   %s\n", up_str);
+	dprintf(2, "Download: %s\n", down_str);
+	dprintf(2, "Total:    %s\n", total_str);
+	dprintf(2, "=========================\n");
+}
+
 static void zero_arg(char *s) {
 	size_t i, l = strlen(s);
 	for(i=0;i<l;i++) s[i] = 0;
+}
+
+static void signal_handler(int sig) {
+	if(sig == SIGINT || sig == SIGTERM) {
+		should_exit = 1;
+		if(show_stats) {
+			show_traffic_stats();
+		}
+	}
 }
 
 int main(int argc, char** argv) {
@@ -436,7 +477,7 @@ int main(int argc, char** argv) {
 	const char *listenip = "0.0.0.0";
 	char *p, *q;
 	unsigned port = 1080;
-	while((ch = getopt(argc, argv, ":1qb:i:p:u:P:w:")) != -1) {
+	while((ch = getopt(argc, argv, ":1qsb:i:p:u:P:w:")) != -1) {
 		switch(ch) {
 			case 'w': /* fall-through */
 			case '1':
@@ -458,6 +499,9 @@ int main(int argc, char** argv) {
 				break;
 			case 'q':
 				quiet = 1;
+				break;
+			case 's':
+				show_stats = 1;
 				break;
 			case 'b':
 				resolve_sa(optarg, 0, &bind_addr);
@@ -492,6 +536,10 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 	signal(SIGPIPE, SIG_IGN);
+	if(show_stats) {
+		signal(SIGINT, signal_handler);
+		signal(SIGTERM, signal_handler);
+	}
 	struct server s;
 	sblist *threads = sblist_new(sizeof (struct thread*), 8);
 	if(server_setup(&s, listenip, port)) {
@@ -500,7 +548,7 @@ int main(int argc, char** argv) {
 	}
 	server = &s;
 
-	while(1) {
+	while(!should_exit) {
 		collect(threads);
 		struct client c;
 		struct thread *curr = malloc(sizeof (struct thread));
