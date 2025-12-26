@@ -33,7 +33,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
-#include <inttypes.h>
 #include "server.h"
 #include "sblist.h"
 
@@ -103,8 +102,6 @@ struct thread {
 	struct client client;
 	enum socksstate state;
 	volatile int  done;
-	uint64_t upload_bytes;
-	uint64_t download_bytes;
 };
 
 #ifndef CONFIG_LOG
@@ -269,7 +266,7 @@ static void send_error(int fd, enum errorcode ec) {
 	write(fd, buf, 10);
 }
 
-static void copyloop(int fd1, int fd2, struct thread *t) {
+static void copyloop(int fd1, int fd2) {
 	struct pollfd fds[2] = {
 		[0] = {.fd = fd1, .events = POLLIN},
 		[1] = {.fd = fd2, .events = POLLIN},
@@ -299,14 +296,6 @@ static void copyloop(int fd1, int fd2, struct thread *t) {
 			ssize_t m = write(outfd, buf+sent, n-sent);
 			if(m < 0) return;
 			sent += m;
-		}
-		// Update traffic statistics
-		if(infd == fd1) {
-			// Data from client to remote: upload
-			t->upload_bytes += n;
-		} else {
-			// Data from remote to client: download
-			t->download_bytes += n;
 		}
 	}
 }
@@ -372,19 +361,10 @@ static void* clientthread(void *data) {
 	struct thread *t = data;
 	int remotefd = handshake(t);
 	if(remotefd != -1) {
-		copyloop(t->client.fd, remotefd, t);
+		copyloop(t->client.fd, remotefd);
 		close(remotefd);
 	}
 	close(t->client.fd);
-	// Log traffic statistics when connection closes
-	if(CONFIG_LOG && t->upload_bytes > 0 || t->download_bytes > 0) {
-		char clientname[256];
-		int af = SOCKADDR_UNION_AF(&t->client.addr);
-		void *ipdata = SOCKADDR_UNION_ADDRESS(&t->client.addr);
-		inet_ntop(af, ipdata, clientname, sizeof clientname);
-		dolog("client[%d] %s: uploaded %" PRIu64 " bytes, downloaded %" PRIu64 " bytes\n", 
-			t->client.fd, clientname, t->upload_bytes, t->download_bytes);
-	}
 	t->done = 1;
 	return 0;
 }
